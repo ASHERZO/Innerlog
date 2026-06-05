@@ -430,6 +430,9 @@ body {
 <div class="toast" id="toast"></div>
 
 <script>
+// ── Config ───────────────────────────────────────────────────────────
+const PROXY = 'https://tiny-butterfly-f3d4.asherzo.workers.dev';
+
 // ── IndexedDB ─────────────────────────────────────────────────────────
 let db;
 function openDB() {
@@ -619,7 +622,7 @@ async function startAnalysis() {
   try {
     setLoadingStep('Transkription läuft...');
     const blob = new Blob(audioChunks, { type: 'audio/webm' });
-    const transcript = await transcribeAudio(blob, keys.hf);
+    const transcript = await transcribeAudio(blob, keys);
     setLoadingStep('Stimmung & Stimm-Emotion wird erkannt...');
     const sentiment = await getSentiment(transcript, keys.hf);
     const voiceEmotion = await getVoiceEmotion(blob, keys.hf);
@@ -640,11 +643,16 @@ async function startAnalysis() {
 }
 function setLoadingStep(t) { document.getElementById('loading-step').textContent = t; }
 
-async function transcribeAudio(blob, hfKey) {
-  const res = await fetch('https://router.huggingface.co/hf-inference/models/openai/whisper-large-v3', {
+async function transcribeAudio(blob, keys) {
+  // Use OpenAI Whisper via proxy
+  const formData = new FormData();
+  formData.append('file', blob, 'audio.webm');
+  formData.append('model', 'whisper-1');
+  formData.append('language', 'de');
+  const res = await fetch(`${PROXY}?target=openai-whisper`, {
     method: 'POST',
-    headers: { 'Authorization': `Bearer ${hfKey}` },
-    body: blob
+    headers: { 'Authorization': `Bearer ${keys.openai}` },
+    body: formData
   });
   if (!res.ok) throw new Error('Whisper Fehler: ' + res.status);
   const data = await res.json();
@@ -653,7 +661,7 @@ async function transcribeAudio(blob, hfKey) {
 
 async function getSentiment(text, hfKey) {
   try {
-    const res = await fetch('https://router.huggingface.co/hf-inference/models/cardiffnlp/twitter-roberta-base-sentiment-latest', {
+    const res = await fetch(`${PROXY}?target=hf-sentiment`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${hfKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ inputs: text.slice(0,512) })
@@ -667,6 +675,53 @@ async function getSentiment(text, hfKey) {
   return { label: 'neutral', score: 0.5 };
 }
 
+async function convertToWav(blob) {
+  // Convert WebM/Opus blob to WAV using Web Audio API
+  try {
+    const arrayBuffer = await blob.arrayBuffer();
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+    audioCtx.close();
+
+    // Get mono channel at 16kHz (optimal for speech models)
+    const numSamples = audioBuffer.length;
+    const numChannels = 1;
+    const sampleRate = audioBuffer.sampleRate;
+    const channelData = audioBuffer.getChannelData(0);
+
+    // Build WAV file manually
+    const wavBuffer = new ArrayBuffer(44 + numSamples * 2);
+    const view = new DataView(wavBuffer);
+    const writeStr = (offset, str) => { for (let i=0; i<str.length; i++) view.setUint8(offset+i, str.charCodeAt(i)); };
+
+    writeStr(0, 'RIFF');
+    view.setUint32(4, 36 + numSamples * 2, true);
+    writeStr(8, 'WAVE');
+    writeStr(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);         // PCM
+    view.setUint16(22, numChannels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeStr(36, 'data');
+    view.setUint32(40, numSamples * 2, true);
+
+    // Convert float32 samples to int16
+    let offset = 44;
+    for (let i = 0; i < numSamples; i++) {
+      const s = Math.max(-1, Math.min(1, channelData[i]));
+      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      offset += 2;
+    }
+    return new Blob([wavBuffer], { type: 'audio/wav' });
+  } catch(e) {
+    console.warn('WAV conversion failed:', e);
+    return blob; // fallback to original
+  }
+}
+
 async function getVoiceEmotion(blob, hfKey) {
   // Models to try in order (some may be loading/cold)
   const models = [
@@ -675,10 +730,11 @@ async function getVoiceEmotion(blob, hfKey) {
   ];
   for (const model of models) {
     try {
-      const res = await fetch(`https://router.huggingface.co/hf-inference/models/${model}`, {
+      const wavBlob = await convertToWav(blob);
+      const res = await fetch(`${PROXY}?target=hf-ser&model=${encodeURIComponent(model)}`, {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${hfKey}` },
-        body: blob
+        headers: { 'Authorization': `Bearer ${hfKey}`, 'Content-Type': 'audio/wav' },
+        body: wavBlob
       });
       if (!res.ok) continue;
       const data = await res.json();
@@ -780,7 +836,7 @@ Regeln: Kurz und konkret. Keine Vorwürfe. Keine spirituellen Floskeln. Affirmat
     ? `Stimm-Emotion: ${voiceEmotion.primary} (${voiceEmotion.primary_score}%)${voiceEmotion.secondary ? ', auch: '+voiceEmotion.secondary : ''} | Valenz: ${voiceEmotion.valence}/10`
     : '';
   const user = `Transkript: "${transcript}"\nSentiment (Text): ${sentiment.label} (${Math.round(sentiment.score*100)}%)\n${voiceStr}\nLetzte 7 Tage: ${JSON.stringify(recent)}`;
-  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+  const res = await fetch(`${PROXY}?target=openai-chat`, {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${openaiKey}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ model: 'gpt-4o-mini', messages: [{ role:'system', content:system },{ role:'user', content:user }], max_tokens: 600, temperature: 0.7 })

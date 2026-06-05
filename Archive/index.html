@@ -467,6 +467,13 @@ function dbClear() {
     tx.onerror = () => rej(tx.error);
   });
 }
+function dbDelete(id) {
+  return new Promise((res, rej) => {
+    const tx = db.transaction('entries', 'readwrite');
+    tx.objectStore('entries').delete(id).onsuccess = () => res();
+    tx.onerror = () => rej(tx.error);
+  });
+}
 
 // ── Backup & Import ───────────────────────────────────────────────────
 async function exportBackup() {
@@ -634,7 +641,7 @@ async function startAnalysis() {
 function setLoadingStep(t) { document.getElementById('loading-step').textContent = t; }
 
 async function transcribeAudio(blob, hfKey) {
-  const res = await fetch('https://api-inference.huggingface.co/models/openai/whisper-large-v3', {
+  const res = await fetch('https://router.huggingface.co/hf-inference/models/openai/whisper-large-v3', {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${hfKey}` },
     body: blob
@@ -646,7 +653,7 @@ async function transcribeAudio(blob, hfKey) {
 
 async function getSentiment(text, hfKey) {
   try {
-    const res = await fetch('https://api-inference.huggingface.co/models/cardiffnlp/twitter-roberta-base-sentiment-latest', {
+    const res = await fetch('https://router.huggingface.co/hf-inference/models/cardiffnlp/twitter-roberta-base-sentiment-latest', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${hfKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ inputs: text.slice(0,512) })
@@ -668,7 +675,7 @@ async function getVoiceEmotion(blob, hfKey) {
   ];
   for (const model of models) {
     try {
-      const res = await fetch(`https://api-inference.huggingface.co/models/${model}`, {
+      const res = await fetch(`https://router.huggingface.co/hf-inference/models/${model}`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${hfKey}` },
         body: blob
@@ -908,12 +915,17 @@ async function renderStats() {
       return `<div class="history-item">
         <div class="history-item-head">
           <span class="history-item-date">${d}</span>
-          <div class="history-item-scores">
-            <span class="history-item-score">⚡${e.energie||'–'}</span>
-            <span class="history-item-score">◎${e.fokus||'–'}</span>
+          <div style="display:flex;align-items:center;gap:10px">
+            <div class="history-item-scores">
+              <span class="history-item-score">⚡${e.energie||'–'}</span>
+              <span class="history-item-score">◎${e.fokus||'–'}</span>
+              ${e.voiceEmotion?.primary ? `<span class="history-item-score" style="color:var(--blue)">🎙${e.voiceEmotion.primary}</span>` : ''}
+            </div>
+            <button onclick="deleteEntry(${e.id})" style="background:none;border:none;cursor:pointer;color:var(--text3);font-size:15px;padding:2px 4px;line-height:1;border-radius:4px;transition:color 0.2s" onmouseover="this.style.color='var(--red)'" onmouseout="this.style.color='var(--text3)'" title="Eintrag löschen">🗑</button>
           </div>
         </div>
         <div class="history-item-affirmation">${e.affirmation||''}</div>
+        ${e.symptom_pattern?.length ? `<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px">${e.symptom_pattern.map(p=>`<span style="font-size:11px;padding:1px 7px;background:rgba(124,106,247,0.08);border:1px solid rgba(124,106,247,0.15);border-radius:20px;color:var(--accent2)">${p}</span>`).join('')}</div>` : ''}
       </div>`;
     }).join('')}
   `;
@@ -964,6 +976,12 @@ async function clearAllData() {
   await dbClear();
   showToast('Alle Daten gelöscht');
   renderSettings();
+}
+async function deleteEntry(id) {
+  if (!confirm('Diesen Eintrag löschen?')) return;
+  await dbDelete(id);
+  showToast('Eintrag gelöscht');
+  renderStats();
 }
 
 // ── Navigation ────────────────────────────────────────────────────────

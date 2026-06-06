@@ -234,6 +234,32 @@ body {
 .import-area strong { color: var(--text2); }
 #import-file { display: none; }
 
+/* Modal */
+.modal-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.7);
+  z-index: 50; display: flex; align-items: flex-end;
+  opacity: 0; transition: opacity 0.25s; pointer-events: none;
+}
+.modal-overlay.open { opacity: 1; pointer-events: all; }
+.modal-sheet {
+  background: var(--surface); border-radius: 20px 20px 0 0;
+  padding: 20px 20px 48px; width: 100%; max-height: 88vh;
+  overflow-y: auto; transform: translateY(100%);
+  transition: transform 0.3s cubic-bezier(0.32,0.72,0,1);
+}
+.modal-overlay.open .modal-sheet { transform: translateY(0); }
+.modal-handle {
+  width: 36px; height: 4px; background: var(--border2);
+  border-radius: 2px; margin: 0 auto 20px;
+}
+.modal-close {
+  position: absolute; top: 16px; right: 16px;
+  background: var(--surface2); border: none; border-radius: 50%;
+  width: 28px; height: 28px; cursor: pointer;
+  color: var(--text2); font-size: 14px; display: flex;
+  align-items: center; justify-content: center;
+}
+
 /* Toast */
 .toast {
   position: fixed; bottom: 90px; left: 50%; transform: translateX(-50%);
@@ -411,6 +437,14 @@ body {
     <div style="font-size:13px;color:var(--text2);line-height:1.7;">
       Alle Einträge, Transkripte und Analysen bleiben auf diesem Gerät in IndexedDB. Nur der Audio-Clip geht kurzfristig an Whisper (HuggingFace) und das Transkript an GPT (OpenAI) — beide ohne Account-Binding, kein Profil wird angelegt. API Keys liegen in localStorage, nur auf diesem Gerät.
     </div>
+  </div>
+</div>
+
+<!-- Entry Detail Modal -->
+<div class="modal-overlay" id="entry-modal" onclick="closeModal(event)">
+  <div class="modal-sheet">
+    <div class="modal-handle"></div>
+    <div id="modal-content"></div>
   </div>
 </div>
 
@@ -725,8 +759,8 @@ async function convertToWav(blob) {
 async function getVoiceEmotion(blob, hfKey) {
   // Models to try in order (some may be loading/cold)
   const models = [
-    'ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition',
-    'superb/wav2vec2-base-superb-er'
+    'padmalcom/wav2vec2-large-xlsr-53-german-emotion',
+    'ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition'
   ];
   for (const model of models) {
     try {
@@ -968,7 +1002,7 @@ async function renderStats() {
     <div style="font-size:11px;font-weight:500;color:var(--text3);text-transform:uppercase;letter-spacing:0.07em;margin-bottom:10px;">Letzte Einträge</div>
     ${entries.slice().reverse().slice(0,10).map(e => {
       const d = new Date(e.date).toLocaleDateString('de-DE',{weekday:'short',day:'numeric',month:'short'});
-      return `<div class="history-item">
+      return `<div class="history-item" onclick="openEntry(${e.id})">
         <div class="history-item-head">
           <span class="history-item-date">${d}</span>
           <div style="display:flex;align-items:center;gap:10px">
@@ -1036,6 +1070,91 @@ async function clearAllData() {
 async function deleteEntry(id) {
   if (!confirm('Diesen Eintrag löschen?')) return;
   await dbDelete(id);
+  showToast('Eintrag gelöscht');
+  renderStats();
+}
+
+// ── Entry Detail Modal ───────────────────────────────────────────────
+async function openEntry(id) {
+  const entries = await dbGetAll();
+  const entry = entries.find(e => e.id === id);
+  if (!entry) return;
+  const el = document.getElementById('modal-content');
+  const d = new Date(entry.date);
+  const dateStr = d.toLocaleDateString('de-DE',{weekday:'long',day:'numeric',month:'long',year:'numeric'});
+  const gestillt = (entry.beduerfnisse_gestillt||[]).map(b=>`<span class="tag tag-green">${b}</span>`).join('');
+  const offen = (entry.beduerfnisse_offen||[]).map(b=>`<span class="tag tag-amber">${b}</span>`).join('');
+  const pattern = (entry.symptom_pattern||[]).map(b=>`<span class="tag tag-purple">${b}</span>`).join('');
+  const sentColor = entry.sentiment?.label?.toLowerCase().includes('neg')?'var(--red)':entry.sentiment?.label?.toLowerCase().includes('pos')?'var(--green)':'var(--blue)';
+  const sentFill = entry.sentiment ? Math.round(entry.sentiment.score*100) : 50;
+
+  el.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+      <div style="font-size:12px;color:var(--text3)">${dateStr}</div>
+      <span class="tag ${stimmungTagClass(entry.stimmung)}">${entry.stimmung||'neutral'}</span>
+    </div>
+    <div class="result-affirmation" style="font-size:17px">"${entry.affirmation||''}"</div>
+    <div class="scores-row">
+      <div class="score-card">
+        <div class="score-val" style="color:${scoreColor(entry.energie)}">${entry.energie||'–'}</div>
+        <div class="score-label">Energie</div>
+      </div>
+      <div class="score-card">
+        <div class="score-val" style="color:${scoreColor(entry.fokus)}">${entry.fokus||'–'}</div>
+        <div class="score-label">Fokus</div>
+      </div>
+      <div class="score-card">
+        <div class="score-val" style="color:${sentColor};font-size:14px;padding-top:6px">${sentimentLabel(entry.sentiment?.label||'')}</div>
+        <div class="score-label">Sentiment</div>
+        <div class="sentiment-bar"><div class="sentiment-fill" style="width:${sentFill}%;background:${sentColor}"></div></div>
+      </div>
+    </div>
+    ${entry.voiceEmotion?.primary && entry.voiceEmotion.primary !== 'Neutral' ? `
+    <div class="section-card" style="border-color:rgba(96,165,250,0.2);background:rgba(96,165,250,0.04);margin-bottom:12px">
+      <div class="section-card-title" style="color:var(--blue)">🎙 Stimm-Emotion</div>
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+        <div>
+          <div style="font-size:18px;font-weight:500;color:var(--text)">${entry.voiceEmotion.primary}</div>
+          <div style="font-size:12px;color:var(--text3);margin-top:2px">${entry.voiceEmotion.primary_score}% Konfidenz${entry.voiceEmotion.secondary ? ' · auch: '+entry.voiceEmotion.secondary : ''}</div>
+        </div>
+        <div style="text-align:right">
+          <div style="font-size:11px;color:var(--text3);margin-bottom:4px">Emotionale Valenz</div>
+          <div style="font-size:20px;font-family:var(--serif);color:${scoreColor(entry.voiceEmotion.valence)}">${entry.voiceEmotion.valence}/10</div>
+        </div>
+      </div>
+    </div>` : ''}
+    ${entry.awareness_impuls?`<div class="section-card" style="border-color:rgba(165,148,249,0.2);background:rgba(124,106,247,0.04)"><div class="section-card-title" style="color:var(--accent2)">◎ Awareness-Impuls</div><div class="section-card-text">${entry.awareness_impuls}</div></div>`:''}
+    ${entry.zusammenhang?`<div class="section-card"><div class="section-card-title">Zusammenhang</div><div class="section-card-text">${entry.zusammenhang}</div></div>`:''}
+    <div class="tip-box">
+      <div class="tip-box-title">✦ Tipp für morgen</div>
+      <div class="tip-box-text">${entry.tipp_morgen||''}</div>
+    </div>
+    ${entry.uebung?`<div class="section-card" style="border-color:rgba(62,207,142,0.2);background:rgba(62,207,142,0.04)"><div class="section-card-title" style="color:var(--green)">🌿 Übung für dich</div><div class="section-card-text">${entry.uebung}</div></div>`:''}
+    ${entry.beduerfnis_vorschlag?`<div class="needs-plan"><div class="tip-box-title" style="color:var(--green)">🌱 Offenes Bedürfnis</div><div class="tip-box-text">${entry.beduerfnis_vorschlag}</div></div>`:''}
+    ${gestillt||offen?`<div class="section-card"><div class="section-card-title">Bedürfnisse</div>${gestillt?`<div style="margin-bottom:8px"><div style="font-size:11px;color:var(--text3);margin-bottom:4px">Gestillt</div><div class="tags-row">${gestillt}</div></div>`:''}${offen?`<div><div style="font-size:11px;color:var(--text3);margin-bottom:4px">Offen</div><div class="tags-row">${offen}</div></div>`:''}</div>`:''}
+    ${pattern?`<div class="section-card"><div class="section-card-title">Erkannte Muster</div><div class="tags-row">${pattern}</div></div>`:''}
+    ${entry.transcript?`<div class="section-card"><div class="section-card-title">Transkript</div><div class="section-card-text" style="font-size:13px;color:var(--text3)">${entry.transcript}</div></div>`:''}
+    <button class="btn-secondary danger" style="margin-top:12px;color:var(--red);border-color:rgba(248,113,113,0.3)" onclick="deleteFromModal(${entry.id})">Eintrag löschen</button>
+  `;
+  document.getElementById('entry-modal').classList.add('open');
+}
+
+function closeModal(e) {
+  if (e.target === document.getElementById('entry-modal') || e.target.classList.contains('modal-sheet') === false) {
+    if (e.target === document.getElementById('entry-modal')) {
+      document.getElementById('entry-modal').classList.remove('open');
+    }
+  }
+}
+
+function closeModalDirect() {
+  document.getElementById('entry-modal').classList.remove('open');
+}
+
+async function deleteFromModal(id) {
+  if (!confirm('Diesen Eintrag löschen?')) return;
+  await dbDelete(id);
+  closeModalDirect();
   showToast('Eintrag gelöscht');
   renderStats();
 }

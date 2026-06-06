@@ -659,7 +659,7 @@ async function startAnalysis() {
     const transcript = await transcribeAudio(blob, keys);
     setLoadingStep('Stimmung & Stimm-Emotion wird erkannt...');
     const sentiment = await getSentiment(transcript, keys.hf);
-    const voiceEmotion = await getVoiceEmotion(transcript, keys.openai);
+    const voiceEmotion = await getVoiceEmotion(blob, keys.hf);
     setLoadingStep('KI analysiert deinen Eintrag...');
     const entries = await dbGetAll();
     const analysis = await analyzeWithGPT(transcript, sentiment, voiceEmotion, entries, keys.openai);
@@ -709,49 +709,106 @@ async function getSentiment(text, hfKey) {
   return { label: 'neutral', score: 0.5 };
 }
 
-async function getVoiceEmotion(transcript, openaiKey) {
-  // Analyse emotionale Valenz aus Transkript via GPT
+async function convertToWav(blob) {
+  // Convert WebM/Opus blob to WAV using Web Audio API
   try {
-    const res = await fetch(`${PROXY}?target=openai-chat`, {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${openaiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        messages: [{
-          role: 'system',
-          content: `Analysiere die emotionale Qualität dieses Sprachtagebuch-Eintrags.
-Antworte NUR als JSON ohne Markdown:
-{
-  "primary": "<dominante Emotion auf Deutsch: Freude|Trauer|Wut|Angst|Ekel|Überraschung|Neutral|Ruhig|Aufgeregt|Erschöpft>",
-  "primary_score": <Konfidenz 50-99>,
-  "secondary": "<zweite Emotion oder null>",
-  "valence": <emotionale Valenz 1-10, 1=sehr negativ, 5=neutral, 10=sehr positiv>,
-  "arousal": <Aktivierungsniveau 1-10, 1=sehr ruhig, 10=sehr aufgewühlt>
-}`
-        }, {
-          role: 'user',
-          content: `Transkript: "${transcript.slice(0, 800)}"`
-        }],
-        max_tokens: 150,
-        temperature: 0.3
-      })
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const raw = data.choices[0].message.content.trim();
-    const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
-    return {
-      primary: parsed.primary,
-      primary_score: parsed.primary_score,
-      secondary: parsed.secondary,
-      valence: Math.max(1, Math.min(10, parsed.valence)),
-      arousal: Math.max(1, Math.min(10, parsed.arousal)),
-      raw: [],
-      model_used: 'gpt-4o-mini'
-    };
+    const arrayBuffer = await blob.arrayBuffer();
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+    audioCtx.close();
+
+    // Get mono channel at 16kHz (optimal for speech models)
+    const numSamples = audioBuffer.length;
+    const numChannels = 1;
+    const sampleRate = audioBuffer.sampleRate;
+    const channelData = audioBuffer.getChannelData(0);
+
+    // Build WAV file manually
+    const wavBuffer = new ArrayBuffer(44 + numSamples * 2);
+    const view = new DataView(wavBuffer);
+    const writeStr = (offset, str) => { for (let i=0; i<str.length; i++) view.setUint8(offset+i, str.charCodeAt(i)); };
+
+    writeStr(0, 'RIFF');
+    view.setUint32(4, 36 + numSamples * 2, true);
+    writeStr(8, 'WAVE');
+    writeStr(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);         // PCM
+    view.setUint16(22, numChannels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeStr(36, 'data');
+    view.setUint32(40, numSamples * 2, true);
+
+    // Convert float32 samples to int16
+    let offset = 44;
+    for (let i = 0; i < numSamples; i++) {
+      const s = Math.max(-1, Math.min(1, channelData[i]));
+      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      offset += 2;
+    }
+    return new Blob([wavBuffer], { type: 'audio/wav' });
   } catch(e) {
-    return null;
+    console.warn('WAV conversion failed:', e);
+    return blob; // fallback to original
   }
+}
+
+async function getVoiceEmotion(blob, hfKey) {
+  // Models to try in order (some may be loading/cold)
+  const models = [
+    'padmalcom/wav2vec2-large-xlsr-53-german-emotion',
+    'ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition'
+  ];
+  for (const model of models) {
+    try {
+      const wavBlob = await convertToWav(blob);
+      const res = await fetch(`${PROXY}?target=hf-ser&model=${encodeURIComponent(model)}`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${hfKey}`, 'Content-Type': 'audio/wav' },
+        body: wavBlob
+      });
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (Array.isArray(data) && data.length > 0) {
+        // Sort by score, take top 2
+        const sorted = data.sort((a, b) => b.score - a.score);
+        const top = sorted[0];
+        const second = sorted[1];
+        // Map English labels to German display labels
+        const labelMap = {
+          'angry':'Wut', 'anger':'Wut',
+          'happy':'Freude', 'happiness':'Freude', 'joy':'Freude',
+          'sad':'Trauer', 'sadness':'Trauer',
+          'fear':'Angst', 'fearful':'Angst',
+          'disgust':'Ekel', 'disgusted':'Ekel',
+          'surprised':'Überraschung', 'surprise':'Überraschung',
+          'neutral':'Neutral', 'calm':'Ruhig',
+          'excited':'Aufgeregt', 'boredom':'Gelangweilt'
+        };
+        const toDE = (l) => labelMap[l?.toLowerCase()] || l;
+        // Convert to 1-10 arousal/valence proxies
+        const positiveEmotions = ['happy','happiness','joy','excited','calm'];
+        const negativeEmotions = ['angry','anger','sad','sadness','fear','fearful','disgust'];
+        const isPositive = positiveEmotions.includes(top.label?.toLowerCase());
+        const isNegative = negativeEmotions.includes(top.label?.toLowerCase());
+        const valence = isPositive ? Math.round(5 + top.score * 4.5) :
+                        isNegative ? Math.round(5 - top.score * 4) : 5;
+        return {
+          primary: toDE(top.label),
+          primary_score: Math.round(top.score * 100),
+          secondary: toDE(second?.label),
+          valence: Math.max(1, Math.min(10, valence)),
+          raw: sorted.slice(0,3).map(d => ({ label: toDE(d.label), score: Math.round(d.score*100) })),
+          model_used: model
+        };
+      }
+    } catch(e) { continue; }
+  }
+  // Fallback: neutral
+  return { primary: 'Neutral', primary_score: 60, secondary: null, valence: 5, raw: [], model_used: null };
 }
 
 async function analyzeWithGPT(transcript, sentiment, voiceEmotion, prevEntries, openaiKey) {
@@ -863,23 +920,21 @@ function showResult(entry) {
     </div>
     ${entry.voiceEmotion?.primary ? `
     <div class="section-card" style="border-color:rgba(96,165,250,0.2);background:rgba(96,165,250,0.04);margin-bottom:12px">
-      <div class="section-card-title" style="color:var(--blue)">🎙 Stimm-Emotion <span style="font-size:10px;opacity:0.6;font-weight:400;text-transform:none;letter-spacing:0">via GPT</span></div>
+      <div class="section-card-title" style="color:var(--blue)">🎙 Stimm-Emotion</div>
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
         <div>
           <div style="font-size:18px;font-weight:500;color:var(--text)">${entry.voiceEmotion.primary}</div>
           <div style="font-size:12px;color:var(--text3);margin-top:2px">${entry.voiceEmotion.primary_score}% Konfidenz${entry.voiceEmotion.secondary ? ' · auch: '+entry.voiceEmotion.secondary : ''}</div>
         </div>
-        <div style="text-align:right;display:flex;flex-direction:column;gap:6px">
-          <div>
-            <div style="font-size:11px;color:var(--text3);margin-bottom:2px">Valenz</div>
-            <div style="font-size:20px;font-family:var(--serif);color:${scoreColor(entry.voiceEmotion.valence)}">${entry.voiceEmotion.valence}/10</div>
-          </div>
-          ${entry.voiceEmotion.arousal ? `<div>
-            <div style="font-size:11px;color:var(--text3);margin-bottom:2px">Aktivierung</div>
-            <div style="font-size:20px;font-family:var(--serif);color:${scoreColor(entry.voiceEmotion.arousal)}">${entry.voiceEmotion.arousal}/10</div>
-          </div>` : ''}
+        <div style="text-align:right">
+          <div style="font-size:11px;color:var(--text3);margin-bottom:4px">Emotionale Valenz</div>
+          <div style="font-size:20px;font-family:var(--serif);color:${scoreColor(entry.voiceEmotion.valence)}">${entry.voiceEmotion.valence}/10</div>
         </div>
       </div>
+      ${entry.voiceEmotion.raw?.length > 1 ? `
+      <div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap">
+        ${entry.voiceEmotion.raw.map(r => `<span style="font-size:11px;padding:2px 8px;background:rgba(96,165,250,0.08);border:1px solid rgba(96,165,250,0.15);border-radius:20px;color:var(--blue)">${r.label} ${r.score}%</span>`).join('')}
+      </div>` : ''}
     </div>` : ''}
     ${entry.awareness_impuls?`<div class="section-card" style="border-color:rgba(165,148,249,0.2);background:rgba(124,106,247,0.04)"><div class="section-card-title" style="color:var(--accent2)">◎ Awareness-Impuls</div><div class="section-card-text">${entry.awareness_impuls}</div></div>`:''}
     ${entry.zusammenhang?`<div class="section-card"><div class="section-card-title">Zusammenhang</div><div class="section-card-text">${entry.zusammenhang}</div></div>`:''}
@@ -973,8 +1028,7 @@ async function renderStats() {
       datasets: [
         { label:'Energie', data:energieData, borderColor:'#7c6af7', backgroundColor:'rgba(124,106,247,0.08)', fill:true, tension:0.4, pointRadius:3, pointBackgroundColor:'#7c6af7' },
         { label:'Fokus', data:fokusData, borderColor:'#3ecf8e', backgroundColor:'rgba(62,207,142,0.06)', fill:true, tension:0.4, pointRadius:3, pointBackgroundColor:'#3ecf8e' },
-        ...(last30.some(e=>e.voiceEmotion?.valence) ? [{ label:'Emotionale Valenz', data:last30.map(e=>e.voiceEmotion?.valence||null), borderColor:'#60a5fa', backgroundColor:'rgba(96,165,250,0.05)', fill:false, tension:0.4, pointRadius:3, pointBackgroundColor:'#60a5fa', spanGaps:true }] : []),
-        ...(last30.some(e=>e.voiceEmotion?.arousal) ? [{ label:'Aktivierung', data:last30.map(e=>e.voiceEmotion?.arousal||null), borderColor:'#f59e0b', backgroundColor:'rgba(245,158,11,0.05)', fill:false, tension:0.4, pointRadius:3, pointBackgroundColor:'#f59e0b', spanGaps:true }] : [])
+        ...(last30.some(e=>e.voiceEmotion?.valence) ? [{ label:'Stimm-Valenz', data:last30.map(e=>e.voiceEmotion?.valence||null), borderColor:'#60a5fa', backgroundColor:'rgba(96,165,250,0.05)', fill:false, tension:0.4, pointRadius:3, pointBackgroundColor:'#60a5fa', spanGaps:true }] : [])
       ]
     },
     options: {
@@ -1055,23 +1109,17 @@ async function openEntry(id) {
         <div class="sentiment-bar"><div class="sentiment-fill" style="width:${sentFill}%;background:${sentColor}"></div></div>
       </div>
     </div>
-    ${entry.voiceEmotion?.primary ? `
+    ${entry.voiceEmotion?.primary && entry.voiceEmotion.primary !== 'Neutral' ? `
     <div class="section-card" style="border-color:rgba(96,165,250,0.2);background:rgba(96,165,250,0.04);margin-bottom:12px">
-      <div class="section-card-title" style="color:var(--blue)">🎙 Stimm-Emotion <span style="font-size:10px;opacity:0.6;font-weight:400;text-transform:none;letter-spacing:0">via GPT</span></div>
+      <div class="section-card-title" style="color:var(--blue)">🎙 Stimm-Emotion</div>
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
         <div>
           <div style="font-size:18px;font-weight:500;color:var(--text)">${entry.voiceEmotion.primary}</div>
           <div style="font-size:12px;color:var(--text3);margin-top:2px">${entry.voiceEmotion.primary_score}% Konfidenz${entry.voiceEmotion.secondary ? ' · auch: '+entry.voiceEmotion.secondary : ''}</div>
         </div>
-        <div style="text-align:right;display:flex;flex-direction:column;gap:6px">
-          <div>
-            <div style="font-size:11px;color:var(--text3);margin-bottom:2px">Valenz</div>
-            <div style="font-size:20px;font-family:var(--serif);color:${scoreColor(entry.voiceEmotion.valence)}">${entry.voiceEmotion.valence}/10</div>
-          </div>
-          ${entry.voiceEmotion.arousal ? `<div>
-            <div style="font-size:11px;color:var(--text3);margin-bottom:2px">Aktivierung</div>
-            <div style="font-size:20px;font-family:var(--serif);color:${scoreColor(entry.voiceEmotion.arousal)}">${entry.voiceEmotion.arousal}/10</div>
-          </div>` : ''}
+        <div style="text-align:right">
+          <div style="font-size:11px;color:var(--text3);margin-bottom:4px">Emotionale Valenz</div>
+          <div style="font-size:20px;font-family:var(--serif);color:${scoreColor(entry.voiceEmotion.valence)}">${entry.voiceEmotion.valence}/10</div>
         </div>
       </div>
     </div>` : ''}

@@ -667,8 +667,25 @@ async function transcribeAudio(blob, keys) {
   return data.text || '';
 }
 
-// ── getSentiment — GPT-4o mini (no HF key needed)
+// ── FIX: getSentiment — was missing, now uses GPT-4o mini as fallback
+// (HuggingFace RoBERTa still attempted first via proxy)
 async function getSentiment(text, openaiKey) {
+  // Try HuggingFace RoBERTa first
+  try {
+    const res = await fetch(`${PROXY}?target=hf-sentiment`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ inputs: text.slice(0, 512) })
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const results = Array.isArray(data[0]) ? data[0] : data;
+      const sorted = [...results].sort((a, b) => b.score - a.score);
+      if (sorted.length > 0) return { label: sorted[0].label, score: sorted[0].score };
+    }
+  } catch(e) { /* fallthrough to GPT */ }
+
+  // Fallback: GPT-4o mini sentiment
   try {
     const res = await fetch(`${PROXY}?target=openai-chat`, {
       method: 'POST',
@@ -693,6 +710,7 @@ async function getSentiment(text, openaiKey) {
       return { label: parsed.label, score: parsed.score };
     }
   } catch(e) { /* fallthrough */ }
+
   return { label: 'neutral', score: 0.5 };
 }
 

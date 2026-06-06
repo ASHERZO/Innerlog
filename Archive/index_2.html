@@ -374,6 +374,7 @@ body {
 <div id="page-settings" class="page">
   <div style="font-family:var(--serif);font-size:22px;margin-bottom:20px;">Einstellungen</div>
 
+  <!-- Backup Section -->
   <div class="settings-section">
     <div class="settings-title">Backup & Wiederherstellung</div>
     <div style="font-size:13px;color:var(--text2);line-height:1.6;margin-bottom:14px;">
@@ -393,15 +394,18 @@ body {
     <div style="font-size:11px;color:var(--text3);margin-top:8px;line-height:1.5;" id="last-backup-info"></div>
   </div>
 
+  <!-- API Keys -->
   <div class="settings-section">
     <div class="settings-title">API Keys</div>
     <div class="settings-row">
       <span>OpenAI Key</span>
       <span class="settings-val" id="s-openai">–</span>
     </div>
+
     <button class="settings-action" style="margin-top:12px" onclick="resetKeys()">Keys neu eingeben</button>
   </div>
 
+  <!-- Data -->
   <div class="settings-section">
     <div class="settings-title">Daten</div>
     <div class="settings-row">
@@ -415,6 +419,7 @@ body {
     <button class="settings-action danger" style="margin-top:12px" onclick="clearAllData()">Alle Daten löschen</button>
   </div>
 
+  <!-- Privacy -->
   <div class="settings-section">
     <div class="settings-title">Datenschutz</div>
     <div style="font-size:13px;color:var(--text2);line-height:1.7;">
@@ -500,19 +505,24 @@ async function exportBackup() {
   const entries = await dbGetAll();
   if (entries.length === 0) { showToast('Keine Einträge zum Exportieren'); return; }
   const payload = {
-    app: 'innerlog', version: 1,
+    app: 'innerlog',
+    version: 1,
     exported_at: new Date().toISOString(),
-    entry_count: entries.length, entries
+    entry_count: entries.length,
+    entries
   };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   const dateStr = new Date().toISOString().slice(0,10);
-  a.href = url; a.download = `innerlog-backup-${dateStr}.json`; a.click();
+  a.href = url;
+  a.download = `innerlog-backup-${dateStr}.json`;
+  a.click();
   URL.revokeObjectURL(url);
   localStorage.setItem('il_last_backup', new Date().toISOString());
   showToast(`${entries.length} Einträge exportiert ✓`);
-  renderSettings(); checkBackupBanner();
+  renderSettings();
+  checkBackupBanner();
 }
 
 async function importBackup(event) {
@@ -524,18 +534,23 @@ async function importBackup(event) {
     if (payload.app !== 'innerlog') { showToast('Ungültige Backup-Datei'); return; }
     const incoming = payload.entries || [];
     const existing = await dbGetAll();
+    // Merge: only add entries not already present (match by date+transcript)
     const existingKeys = new Set(existing.map(e => e.date + '|' + (e.transcript||'').slice(0,40)));
     let added = 0;
     for (const entry of incoming) {
       const key = entry.date + '|' + (entry.transcript||'').slice(0,40);
       if (!existingKeys.has(key)) {
-        const { id, ...rest } = entry;
-        await dbAdd(rest); added++;
+        const { id, ...rest } = entry; // remove old id, let DB assign new one
+        await dbAdd(rest);
+        added++;
       }
     }
     showToast(`${added} neue Einträge importiert ✓`);
-    renderSettings(); event.target.value = '';
-  } catch(e) { showToast('Fehler beim Importieren: ' + e.message); }
+    renderSettings();
+    event.target.value = '';
+  } catch(e) {
+    showToast('Fehler beim Importieren: ' + e.message);
+  }
 }
 
 function checkBackupBanner() {
@@ -549,7 +564,7 @@ function checkBackupBanner() {
 
 // ── Keys ──────────────────────────────────────────────────────────────
 function getKeys() {
-  return { openai: localStorage.getItem('il_openai')||'' };
+  return { openai: localStorage.getItem('il_openai')||'', hf: '' };
 }
 function saveKeys() {
   const ok = document.getElementById('key-openai').value.trim();
@@ -627,17 +642,12 @@ async function startAnalysis() {
     setLoadingStep('Transkription läuft...');
     const blob = new Blob(audioChunks, { type: 'audio/webm' });
     const transcript = await transcribeAudio(blob, keys);
-
-    setLoadingStep('Stimmungsanalyse läuft...');
-    const sentiment = await getSentiment(transcript, keys.openai);
-
-    setLoadingStep('Stimm-Emotion wird analysiert...');
-    const voiceEmotion = await getVoiceEmotion(transcript, keys.openai);
-
+    setLoadingStep('Stimmung & Stimm-Emotion wird erkannt...');
+    const sentiment = await getSentiment(transcript, keys.hf);
+    const voiceEmotion = await getVoiceEmotion(blob, keys.hf);
     setLoadingStep('KI analysiert deinen Eintrag...');
     const entries = await dbGetAll();
     const analysis = await analyzeWithGPT(transcript, sentiment, voiceEmotion, entries, keys.openai);
-
     const entry = { date: new Date().toISOString(), transcript, sentiment, voiceEmotion, ...analysis };
     await dbAdd(entry);
     document.getElementById('loading-section').style.display = 'none';
@@ -653,6 +663,7 @@ async function startAnalysis() {
 function setLoadingStep(t) { document.getElementById('loading-step').textContent = t; }
 
 async function transcribeAudio(blob, keys) {
+  // Use OpenAI Whisper via proxy
   const formData = new FormData();
   formData.append('file', blob, 'audio.webm');
   formData.append('model', 'whisper-1');
@@ -667,54 +678,108 @@ async function transcribeAudio(blob, keys) {
   return data.text || '';
 }
 
-// ── FIX: getSentiment — was missing, now uses GPT-4o mini as fallback
-// (HuggingFace RoBERTa still attempted first via proxy)
-async function getSentiment(text, openaiKey) {
-  // Try HuggingFace RoBERTa first
+async function convertToWav(blob) {
+  // Convert WebM/Opus blob to WAV using Web Audio API
   try {
-    const res = await fetch(`${PROXY}?target=hf-sentiment`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ inputs: text.slice(0, 512) })
-    });
-    if (res.ok) {
-      const data = await res.json();
-      const results = Array.isArray(data[0]) ? data[0] : data;
-      const sorted = [...results].sort((a, b) => b.score - a.score);
-      if (sorted.length > 0) return { label: sorted[0].label, score: sorted[0].score };
-    }
-  } catch(e) { /* fallthrough to GPT */ }
+    const arrayBuffer = await blob.arrayBuffer();
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+    audioCtx.close();
 
-  // Fallback: GPT-4o mini sentiment
-  try {
-    const res = await fetch(`${PROXY}?target=openai-chat`, {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${openaiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        messages: [{
-          role: 'system',
-          content: 'Analysiere das Sentiment dieses Texts. Antworte NUR als JSON ohne Markdown: {"label": "positive|neutral|negative", "score": <0.5-0.99>}'
-        }, {
-          role: 'user',
-          content: text.slice(0, 600)
-        }],
-        max_tokens: 60,
-        temperature: 0.1
-      })
-    });
-    if (res.ok) {
-      const data = await res.json();
-      const raw = data.choices[0].message.content.trim().replace(/```json|```/g, '').trim();
-      const parsed = JSON.parse(raw);
-      return { label: parsed.label, score: parsed.score };
-    }
-  } catch(e) { /* fallthrough */ }
+    // Get mono channel at 16kHz (optimal for speech models)
+    const numSamples = audioBuffer.length;
+    const numChannels = 1;
+    const sampleRate = audioBuffer.sampleRate;
+    const channelData = audioBuffer.getChannelData(0);
 
-  return { label: 'neutral', score: 0.5 };
+    // Build WAV file manually
+    const wavBuffer = new ArrayBuffer(44 + numSamples * 2);
+    const view = new DataView(wavBuffer);
+    const writeStr = (offset, str) => { for (let i=0; i<str.length; i++) view.setUint8(offset+i, str.charCodeAt(i)); };
+
+    writeStr(0, 'RIFF');
+    view.setUint32(4, 36 + numSamples * 2, true);
+    writeStr(8, 'WAVE');
+    writeStr(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);         // PCM
+    view.setUint16(22, numChannels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeStr(36, 'data');
+    view.setUint32(40, numSamples * 2, true);
+
+    // Convert float32 samples to int16
+    let offset = 44;
+    for (let i = 0; i < numSamples; i++) {
+      const s = Math.max(-1, Math.min(1, channelData[i]));
+      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      offset += 2;
+    }
+    return new Blob([wavBuffer], { type: 'audio/wav' });
+  } catch(e) {
+    console.warn('WAV conversion failed:', e);
+    return blob; // fallback to original
+  }
 }
 
-// ── FIX: Single getVoiceEmotion — GPT-based only (wav2vec2 removed, was 400ing)
+async function getVoiceEmotion(blob, hfKey) {
+  // Models to try in order (some may be loading/cold)
+  const models = [
+    'ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition',
+    'superb/wav2vec2-base-superb-er'
+  ];
+  for (const model of models) {
+    try {
+      const wavBlob = await convertToWav(blob);
+      const res = await fetch(`${PROXY}?target=hf-ser&model=${encodeURIComponent(model)}`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${hfKey}`, 'Content-Type': 'audio/wav' },
+        body: wavBlob
+      });
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (Array.isArray(data) && data.length > 0) {
+        // Sort by score, take top 2
+        const sorted = data.sort((a, b) => b.score - a.score);
+        const top = sorted[0];
+        const second = sorted[1];
+        // Map English labels to German display labels
+        const labelMap = {
+          'angry':'Wut', 'anger':'Wut',
+          'happy':'Freude', 'happiness':'Freude', 'joy':'Freude',
+          'sad':'Trauer', 'sadness':'Trauer',
+          'fear':'Angst', 'fearful':'Angst',
+          'disgust':'Ekel', 'disgusted':'Ekel',
+          'surprised':'Überraschung', 'surprise':'Überraschung',
+          'neutral':'Neutral', 'calm':'Ruhig',
+          'excited':'Aufgeregt', 'boredom':'Gelangweilt'
+        };
+        const toDE = (l) => labelMap[l?.toLowerCase()] || l;
+        // Convert to 1-10 arousal/valence proxies
+        const positiveEmotions = ['happy','happiness','joy','excited','calm'];
+        const negativeEmotions = ['angry','anger','sad','sadness','fear','fearful','disgust'];
+        const isPositive = positiveEmotions.includes(top.label?.toLowerCase());
+        const isNegative = negativeEmotions.includes(top.label?.toLowerCase());
+        const valence = isPositive ? Math.round(5 + top.score * 4.5) :
+                        isNegative ? Math.round(5 - top.score * 4) : 5;
+        return {
+          primary: toDE(top.label),
+          primary_score: Math.round(top.score * 100),
+          secondary: toDE(second?.label),
+          valence: Math.max(1, Math.min(10, valence)),
+          raw: sorted.slice(0,3).map(d => ({ label: toDE(d.label), score: Math.round(d.score*100) })),
+          model_used: model
+        };
+      }
+    } catch(e) { continue; }
+  }
+  // Fallback: neutral
+  return { primary: 'Neutral', primary_score: 60, secondary: null, valence: 5, raw: [], model_used: null };
+}
+
 async function getVoiceEmotion(transcript, openaiKey) {
   try {
     const res = await fetch(`${PROXY}?target=openai-chat`, {
@@ -914,6 +979,7 @@ async function renderStats() {
   const fokusData = last90.map(e => e.fokus||0);
   const avgE = (energieData.reduce((a,b)=>a+b,0)/energieData.length).toFixed(1);
   const minIdx = energieData.indexOf(Math.min(...energieData));
+  // Correlation: voice valence vs energie
   let corrInsight = '';
   const paired = last90.filter(e => e.voiceEmotion?.valence && e.energie);
   if (paired.length >= 5) {
@@ -931,6 +997,7 @@ async function renderStats() {
       corrInsight = `Stimm-Valenz & Energie: <strong>${strength} ${dir} Korrelation (r=${r})</strong> über ${paired.length} Einträge — deine Stimme spiegelt deinen Energiezustand ${Math.abs(rNum)>0.5?'zuverlässig':'tendenziell'} wider.`;
     }
   }
+
   const insight = entries.length >= 3
     ? `Dein Energie-Durchschnitt: <strong>${avgE}/10</strong> über ${last90.length} Tage. Tiefstwert am ${labels[minIdx]}.`
     : '';
@@ -993,6 +1060,7 @@ async function renderStats() {
 async function renderSettings() {
   const keys = getKeys();
   document.getElementById('s-openai').textContent = keys.openai ? 'sk-···'+keys.openai.slice(-4) : 'nicht gesetzt';
+
   const entries = await dbGetAll();
   document.getElementById('s-count').textContent = entries.length;
   const last = localStorage.getItem('il_last_backup');
@@ -1009,11 +1077,15 @@ async function renderSettings() {
 }
 async function clearAllData() {
   if (!confirm('Alle Einträge wirklich löschen? Das kann nicht rückgängig gemacht werden.')) return;
-  await dbClear(); showToast('Alle Daten gelöscht'); renderSettings();
+  await dbClear();
+  showToast('Alle Daten gelöscht');
+  renderSettings();
 }
 async function deleteEntry(id) {
   if (!confirm('Diesen Eintrag löschen?')) return;
-  await dbDelete(id); showToast('Eintrag gelöscht'); renderStats();
+  await dbDelete(id);
+  showToast('Eintrag gelöscht');
+  renderStats();
 }
 
 // ── Entry Detail Modal ───────────────────────────────────────────────
@@ -1063,7 +1135,10 @@ function closeModalDirect() {
 }
 async function deleteFromModal(id) {
   if (!confirm('Diesen Eintrag löschen?')) return;
-  await dbDelete(id); closeModalDirect(); showToast('Eintrag gelöscht'); renderStats();
+  await dbDelete(id);
+  closeModalDirect();
+  showToast('Eintrag gelöscht');
+  renderStats();
 }
 
 // ── Navigation ────────────────────────────────────────────────────────
